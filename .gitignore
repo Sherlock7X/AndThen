@@ -40,3 +40,8 @@ wheels/
 
 # folders
 backpack/
+
+# others
+*.csv
+*.pkl
+*.zip

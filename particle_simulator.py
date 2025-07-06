@@ -9,9 +9,9 @@ class ParticleMonteCarlo:
         num_particles: int = 10_000,
         time_steps: int = 252,
         dt: float = 1.0 / 252,
-        bins: int = 200,
+        bins: int = 100,
         rng: np.random.Generator = np.random.default_rng(),
-        method: str = 'bin'  # Method for computing conditional expectation ('bin' or 'kernel')
+        method: str = 'kernel'  # Method for computing conditional expectation ('bin' or 'kernel')
     ):
         """
         Monte Carlo simulator for Path-Dependent Volatility models.
@@ -374,7 +374,7 @@ if __name__ == "__main__":
     particle_mc = ParticleMonteCarlo(
         model=pdv_model,
         num_paths=1_000,      # Number of paths for final simulation 
-        num_particles=50_000, # Number of particles for leverage calibration
+        num_particles=10_000, # Number of particles for leverage calibration
         time_steps=252,
         bins=100,
         method='kernel'
