@@ -2,6 +2,7 @@ import numpy as np
 from typing import Dict, Union, List, Tuple, Optional
 from BasePricer import BasePricer
 from particle_simulator import ParticleMonteCarlo
+from LocalVolSimulator import LocalVolSimulator
 
 class MCPricer(BasePricer):
     """
@@ -40,21 +41,26 @@ class MCPricer(BasePricer):
         
     def setup_simulation(
             self, 
-            num_paths: int = 10000, 
+            num_paths: int = 1000,
+            num_particles: int = 10000,
             time_steps: int = 252,
             dt: float = 1/252,
             bins: int = 200,
-            method: str = 'bin'
+            method: str = 'bin',
+            use_local_vol_simulator: bool = None
         ) -> None:
         """
         Setup the Monte Carlo simulation environment.
         
         Args:
-            num_paths: Number of paths for simulation
+            num_paths: Number of paths for final simulation
+            num_particles: Number of particles for leverage calibration (PDV model only)
             time_steps: Number of time steps for simulation
             dt: Time step size (default: 1/252 for daily steps)
             bins: Number of bins for discretizing the stock price range
             method: Method for computing conditional expectation ('bin' or 'kernel')
+            use_local_vol_simulator: Whether to use LocalVolSimulator. If None,
+                                    will auto-detect based on model properties.
         """
         self.num_paths = num_paths
         self.time_steps = time_steps
@@ -63,29 +69,56 @@ class MCPricer(BasePricer):
         # Double the number of paths if using antithetic variates
         effective_paths = num_paths * 2 if self.use_antithetic else num_paths
         
-        # Initialize the simulator
-        self.simulator = ParticleMonteCarlo(
-            model=self.model,
-            num_particles=effective_paths,
-            time_steps=time_steps,
-            dt=dt,
-            bins=bins,
-            rng=self.rng,
-            method=method
-        )
+        # Auto-detect if we should use LocalVolSimulator
+        if use_local_vol_simulator is None:
+            # Check if model has local_vol method (needed for LocalVolSimulator)
+            use_local_vol_simulator = hasattr(self.model, 'local_vol') and not hasattr(self.model, 'sigma')
         
-    def run_simulation(self) -> Tuple[np.ndarray, np.ndarray]:
+        # Initialize the appropriate simulator
+        if use_local_vol_simulator:
+            print("Using LocalVolSimulator for local volatility model")
+            self.simulator = LocalVolSimulator(
+                model=self.model,
+                num_particles=effective_paths,  # For LocalVolSimulator, particles = paths
+                time_steps=time_steps,
+                dt=dt,
+                rng=self.rng
+            )
+        else:
+            print("Using ParticleMonteCarlo for path-dependent volatility model")
+            # For PDV model, we need both num_paths and num_particles
+            self.simulator = ParticleMonteCarlo(
+                model=self.model,
+                num_paths=effective_paths,  # For final simulation
+                num_particles=num_particles,  # For leverage calibration
+                time_steps=time_steps,
+                dt=dt,
+                bins=bins,
+                rng=self.rng,
+                method=method
+            )
+        
+    def run_simulation(self) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """
         Run the simulation to generate paths.
         
         Returns:
-            Tuple containing (pathS, pathX)
+            If using a local volatility model: just pathS (ndarray)
+            Otherwise: Tuple containing (pathS, pathX)
         """
         if self.simulator is None:
             raise ValueError("Simulation environment not set up. Call setup_simulation first.")
-            
-        self.paths, self.path_x = self.simulator.simulate()
-        return self.paths, self.path_x
+        
+        # Check if we're using a local volatility model (LocalVolSimulator)
+        if isinstance(self.simulator, LocalVolSimulator):
+            # Local volatility model only returns paths, not path_x
+            self.paths = self.simulator.simulate()
+            self.path_x = None
+            return self.paths
+        else:
+            # Path-dependent volatility model returns both paths and path_x
+            self.paths, self.path_x = self.simulator.simulate()
+            return self.paths, self.path_x
     
     def price(
             self, 
@@ -123,7 +156,12 @@ class MCPricer(BasePricer):
             payoffs = self.payoff_digital(option_type, terminal_prices, strike)
         elif callable(payoff_func):
             # Custom payoff function
-            payoffs = payoff_func(terminal_prices, self.path_x[:, expiry_step], strike)
+            if self.path_x is not None:
+                # For path-dependent models with state variables
+                payoffs = payoff_func(terminal_prices, self.path_x[:, expiry_step], strike)
+            else:
+                # For local volatility models with no state variables
+                payoffs = payoff_func(terminal_prices, None, strike)
         else:
             raise ValueError(f"Unsupported payoff function: {payoff_func}")
             
@@ -259,6 +297,66 @@ class MCPricer(BasePricer):
         payoffs = self.payoff_european(option_type, avg_prices, strike)
         
         # Apply discount factor
+        discounted_payoffs = self.discount(payoffs, expiry)
+        
+        # Calculate price and error
+        price = np.mean(discounted_payoffs)
+        std_error = np.std(discounted_payoffs) / np.sqrt(len(discounted_payoffs))
+        
+        return {
+            'price': price,
+            'std_error': std_error,
+            'conf_interval_95': [price - 1.96 * std_error, price + 1.96 * std_error]
+        }
+    
+    def price_forward_start(
+            self,
+            option_type: str,
+            strike: float,
+            start_time: float,  # Time when the option actually starts
+            expiry: float,      # Total time to expiry from now (includes start_time)
+            **kwargs
+        ) -> Dict[str, float]:
+        """
+        Price a forward start option using Monte Carlo simulation.
+        
+        A forward start option begins at a future date (start_time) with a strike price
+        that's determined as a percentage of the underlying price at that future date.
+        
+        Args:
+            option_type: Type of option ('call', 'put')
+            strike_pct: Strike price as a percentage of the underlying price at start_time (e.g., 1.0 for ATM)
+            start_time: Time when the option begins (years from now)
+            expiry: Total time to expiry from now (years, includes start_time)
+            
+        Returns:
+            Dictionary containing the price and error estimates
+        """
+        if self.paths is None:
+            self.run_simulation()
+            
+        # Convert times to corresponding time steps
+        start_step = min(int(start_time / self.dt), self.time_steps)
+        expiry_step = min(int(expiry / self.dt), self.time_steps)
+        
+        # Ensure start_step is before expiry_step
+        if start_step >= expiry_step:
+            raise ValueError("Start time must be before expiry time")
+            
+        # Get prices at the start date and terminal date
+        start_prices = self.paths[:, start_step]
+        terminal_prices = self.paths[:, expiry_step] / start_prices
+
+        
+        # Calculate payoffs (vectorized)
+        if option_type.lower() == 'call':
+            payoffs = np.maximum(terminal_prices - strike, 0)
+        elif option_type.lower() == 'put':
+            payoffs = np.maximum(strike - terminal_prices, 0)
+        else:
+            raise ValueError(f"Unsupported option type: {option_type}")
+            
+        # Apply discount factor (from now until expiry)
         discounted_payoffs = self.discount(payoffs, expiry)
         
         # Calculate price and error
