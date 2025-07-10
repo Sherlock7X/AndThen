@@ -49,7 +49,7 @@ class BaseModel(ABC):
         use_sobol: bool = False,
         rng: np.random.Generator = np.random.default_rng()
     ) -> np.ndarray:
-        dt = 1.0 / num_steps
+        dt = 1.0 / 252
         if use_sobol:
             from scipy.stats import qmc, norm
             sampler = qmc.Sobol(d=num_steps, scramble=True)
